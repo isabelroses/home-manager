@@ -1656,6 +1656,16 @@ in {
           See https://codeberg.org/dnkl/yambar for more.
         '';
       }
+
+      {
+        time = "2024-05-17T20:29:49+00:00";
+        message = ''
+          A new module is available: 'programs.izrss'.
+
+          An RSS feed reader for the terminal written in Go.
+          See https://github.com/isabelroses/izrss for more.
+        '';
+      }
     ];
   };
 }

@@ -126,6 +126,7 @@ let
     ./programs/info.nix
     ./programs/ion.nix
     ./programs/irssi.nix
+    ./programs/izrss.nix
     ./programs/java.nix
     ./programs/jetbrains-remote.nix
     ./programs/jq.nix

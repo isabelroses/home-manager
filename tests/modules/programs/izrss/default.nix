@@ -1,0 +1,1 @@
+{ izrss-settings = ./settings.nix; }

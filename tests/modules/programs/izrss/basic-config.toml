@@ -1,0 +1,8 @@
+dateformat = "2006/01/02"
+
+[colors]
+text = "#cdd6f4"
+inverttext = "#1e1e2e"
+subtext = "#a6adc8"
+accent = "#74c7ec"
+borders = "#313244"
