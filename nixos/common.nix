@@ -14,11 +14,11 @@ let
   hmModule = types.submoduleWith {
     description = "Home Manager module";
     class = "homeManager";
-    specialArgs = {
+    specialArgs = recursiveUpdate {
       lib = extendedLib;
       osConfig = config;
       modulesPath = builtins.toString ../modules;
-    } // cfg.extraSpecialArgs;
+    } cfg.extraSpecialArgs;
     modules = [
       ({ name, ... }: {
         imports = import ../modules/modules.nix {
