@@ -54,7 +54,6 @@ let
         path = file.source;
         name = sourceName;
       };
-
 in
 
 {
@@ -92,6 +91,68 @@ in
       type = lib.types.package;
       internal = true;
       description = "Package to contain all home files";
+    };
+
+    home-files-manifest = lib.mkOption {
+      type = lib.types.submodule {
+        freeformType = (pkgs.formats.json { }).type;
+
+        options = {
+          version = lib.mkOption {
+            type = lib.types.int;
+            default = 3;
+          };
+
+          files = lib.mkOption {
+            type = lib.types.listOf lib.types.attrs;
+          };
+        };
+      };
+
+      internal = true;
+      description = ''
+        Structured manifest entries describing the files in
+        {option}`home.file`, serialized to JSON for consumption by
+        [smfh](https://github.com/feel-co/smfh). Populated only when
+        {option}`home.linker.backend` is `"smfh"`.
+      '';
+    };
+
+    home.linker = {
+      backend = lib.mkOption {
+        type = lib.types.enum [
+          "builtin"
+          "smfh"
+        ];
+        default = "builtin";
+        description = ''
+          Which backend Home Manager uses to link files from {option}`home.file`
+          into {env}`HOME` during activation.
+
+          - `builtin` (default): the shell-based linker that has always
+            shipped with Home Manager.
+          - `smfh`: build a JSON manifest from {option}`home.file` and invoke
+            [smfh](https://github.com/feel-co/smfh) against it. Note that
+            {env}`HOME_MANAGER_BACKUP_EXT` and `HOME_MANAGER_BACKUP_COMMAND`
+            are ignored. smfh handles backups itself via its own prefix (see
+            {option}`home.linker.smfh.backupPrefix`).
+        '';
+      };
+
+      smfh = {
+        package = lib.mkPackageOption pkgs "smfh" { };
+
+        backupPrefix = lib.mkOption {
+          type = lib.types.str;
+          default = ".backup-";
+          description = ''
+            Prefix prepended by smfh to the basename of an existing file when
+            it is moved out of the way during activation. Passed via
+            `--prefix`. Only used when {option}`home.linker.backend` is
+            `"smfh"`.
+          '';
+        };
+      };
     };
   };
 
@@ -137,33 +198,36 @@ in
       in
       pkgs.runCommandLocal name { } "ln -s ${lib.escapeShellArg pathStr} $out";
 
-    # This verifies that the links we are about to create will not
-    # overwrite an existing file.
-    home.activation.checkLinkTargets = lib.hm.dag.entryBefore [ "writeBoundary" ] (
-      let
-        # Paths that should be forcibly overwritten by Home Manager.
-        # Caveat emptor!
-        forcedPaths = lib.concatMapStringsSep " " (p: ''"$HOME"/${lib.escapeShellArg p}'') (
-          map (v: v.target) (lib.filter (v: v.force) cfg)
-        );
+    # This verifies that the links we are about to create will not overwrite an
+    # existing file. this only needs to run if using the builtin linker. smfh
+    # handles collisions itself
+    home.activation.checkLinkTargets = lib.mkIf (config.home.linker.backend == "builtin") (
+      lib.hm.dag.entryBefore [ "writeBoundary" ] (
+        let
+          # Paths that should be forcibly overwritten by Home Manager.
+          # Caveat emptor!
+          forcedPaths = lib.concatMapStringsSep " " (p: ''"$HOME"/${lib.escapeShellArg p}'') (
+            map (v: v.target) (lib.filter (v: v.force) cfg)
+          );
 
-        storeDir = lib.escapeShellArg builtins.storeDir;
+          storeDir = lib.escapeShellArg builtins.storeDir;
 
-        check = pkgs.replaceVars ./files/check-link-targets.sh {
-          inherit (config.lib.bash) initHomeManagerLib;
-          inherit forcedPaths storeDir;
-        };
-      in
-      ''
-        function checkNewGenCollision() {
-          local newGenFiles
-          newGenFiles="$(readlink -e "$newGenPath/home-files")"
-          find "$newGenFiles" \( -type f -or -type l \) \
-              -exec bash ${check} "$newGenFiles" {} +
-        }
+          check = pkgs.replaceVars ./files/check-link-targets.sh {
+            inherit (config.lib.bash) initHomeManagerLib;
+            inherit forcedPaths storeDir;
+          };
+        in
+        ''
+          function checkNewGenCollision() {
+            local newGenFiles
+            newGenFiles="$(readlink -e "$newGenPath/home-files")"
+            find "$newGenFiles" \( -type f -or -type l \) \
+                -exec bash ${check} "$newGenFiles" {} +
+          }
 
-        checkNewGenCollision || exit 1
-      ''
+          checkNewGenCollision || exit 1
+        ''
+      )
     );
 
     # This activation script will
@@ -185,193 +249,221 @@ in
     # result in lost links because this set of links are in both the
     # source and target generation.
     home.activation.linkGeneration = lib.hm.dag.entryAfter [ "writeBoundary" ] (
-      let
-        link = pkgs.writeShellScript "link" ''
-          ${config.lib.bash.initHomeManagerLib}
-
-          newGenFiles="$1"
-          shift
-
-          # Classify every target using bash builtins only: even one forked
-          # process per file costs several milliseconds on some platforms
-          # (notably darwin), which dominates activation time when a profile
-          # carries hundreds of links. Targets occupied by a regular file or
-          # directory keep the original per-file handling (backup and
-          # identical-content skip) on the slow path below.
-          declare -a symlinkTargets=() symlinkSources=()
-          declare -a linkSources=() linkDirs=()
-          declare -a slowSources=()
-          for sourcePath in "$@" ; do
-            relativePath="''${sourcePath#$newGenFiles/}"
-            targetPath="$HOME/$relativePath"
-            if [[ -L "''${targetPath%/*}" ]] ; then
-              # The parent directory is itself a symlink (e.g. a stale
-              # whole-directory link from an older layout). The batched
-              # `ln -n -t` below would refuse it ("Not a directory"), while
-              # the original per-file `ln -T` traverses it; keep upstream
-              # behavior on the slow path.
-              slowSources+=("$sourcePath")
-            elif [[ -L "$targetPath" ]] ; then
-              symlinkTargets+=("$targetPath")
-              symlinkSources+=("$sourcePath")
-            elif [[ -e "$targetPath" ]] ; then
-              slowSources+=("$sourcePath")
-            else
-              linkSources+=("$sourcePath")
-              linkDirs+=("''${targetPath%/*}")
-            fi
-          done
-
-          # Resolve all existing symlinks with a single readlink call and
-          # relink only those not already pointing at the new generation.
-          if [[ ''${#symlinkTargets[@]} -gt 0 ]] ; then
-            i=0
-            while IFS= read -r -d "" currentSource ; do
-              if [[ "$currentSource" != "''${symlinkSources[i]}" ]] ; then
-                linkSources+=("''${symlinkSources[i]}")
-                linkDirs+=("''${symlinkTargets[i]%/*}")
-              fi
-              i=$(( i + 1 ))
-            done < <(readlink -z -- "''${symlinkTargets[@]}")
-
-            # readlink prints no record for an operand that vanished since
-            # the classification loop above, and its exit status is lost
-            # through the process substitution. A missing record shifts
-            # every later result onto the wrong source, so the links after
-            # it would be compared against someone else's target and left
-            # stale. The record count is the only signal that happened.
-            if [[ $i -ne ''${#symlinkTargets[@]} ]] ; then
-              errorEcho "A link target changed while resolving symlinks; retry activation."
-              exit 1
-            fi
-          fi
-
-          # Create all missing parent directories in one mkdir call.
-          declare -A missingDirs=()
-          for targetDir in "''${linkDirs[@]}" ; do
-            [[ -d "$targetDir" ]] || missingDirs[$targetDir]=1
-          done
-          if [[ ''${#missingDirs[@]} -gt 0 ]] ; then
-            run mkdir -p $VERBOSE_ARG -- "''${!missingDirs[@]}" || exit 1
-          fi
-
-          # Group the pending links by parent directory, one ln call per
-          # directory. The link name always equals the source basename, and
-          # -f -n together replace a stale symlink even when it points at a
-          # directory (the case -T guarded against in the per-file version;
-          # a regular directory in the way takes the slow path instead and
-          # fails there just like it always did).
-          declare -A dirBatches=()
-          for i in "''${!linkSources[@]}" ; do
-            dirBatches[''${linkDirs[i]}]+="$i "
-          done
-          for targetDir in "''${!dirBatches[@]}" ; do
-            batch=()
-            for i in ''${dirBatches[$targetDir]} ; do
-              batch+=("''${linkSources[i]}")
-            done
-            run ln -sfn $VERBOSE_ARG -t "$targetDir" -- "''${batch[@]}" || exit 1
-          done
-
-          # Slow path: the target exists and is not a symlink. This is the
-          # original per-file logic, kept verbatim for the rare collisions.
-          for sourcePath in "''${slowSources[@]}" ; do
-            relativePath="''${sourcePath#$newGenFiles/}"
-            targetPath="$HOME/$relativePath"
-            if [[ -e "$targetPath" && ! -L "$targetPath" ]] ; then
-              if [[ -n "$HOME_MANAGER_BACKUP_COMMAND" ]] ; then
-                verboseEcho "Running '$HOME_MANAGER_BACKUP_COMMAND' on '$targetPath'."
-                run $HOME_MANAGER_BACKUP_COMMAND "$targetPath" || errorEcho "Running '$HOME_MANAGER_BACKUP_COMMAND' on '$targetPath' failed."
-              elif [[ -n "$HOME_MANAGER_BACKUP_EXT" ]] ; then
-                # The target exists, back it up
-                backup="$targetPath.$HOME_MANAGER_BACKUP_EXT"
-                if [[ -e "$backup" && -n "$HOME_MANAGER_BACKUP_OVERWRITE" ]]; then
-                  run rm $VERBOSE_ARG "$backup"
-                fi
-                run mv $VERBOSE_ARG "$targetPath" "$backup" || errorEcho "Moving '$targetPath' failed!"
-              fi
-            fi
-
-            if [[ -e "$targetPath" && ! -L "$targetPath" ]] && cmp -s "$sourcePath" "$targetPath" ; then
-              # The target exists but is identical - don't do anything.
-              verboseEcho "Skipping '$targetPath' as it is identical to '$sourcePath'"
-            else
-              # Place that symlink, --force
-              # This can still fail if the target is a directory, in which case we bail out.
-              run mkdir -p $VERBOSE_ARG "$(dirname "$targetPath")"
-              run ln -Tsf $VERBOSE_ARG "$sourcePath" "$targetPath" || exit 1
-            fi
-          done
-        '';
-
-        cleanup = pkgs.writeShellScript "cleanup" ''
-          ${config.lib.bash.initHomeManagerLib}
-
-          # A symbolic link whose target path matches this pattern will be
-          # considered part of a Home Manager generation.
-          homeFilePattern="$(readlink -e ${lib.escapeShellArg builtins.storeDir})/*-home-manager-files/*"
-
-          newGenFiles="$1"
-          shift 1
-          for relativePath in "$@" ; do
-            targetPath="$HOME/$relativePath"
-            if [[ -e "$newGenFiles/$relativePath" ]] ; then
-              verboseEcho "Checking $targetPath: exists"
-            elif [[ ! "$(readlink "$targetPath")" == $homeFilePattern ]] ; then
-              warnEcho "Path '$targetPath' does not link into a Home Manager generation. Skipping delete."
-            else
-              verboseEcho "Checking $targetPath: gone (deleting)"
-              run rm $VERBOSE_ARG "$targetPath"
-
-              # Recursively delete empty parent directories.
-              targetDir="$(dirname "$relativePath")"
-              if [[ "$targetDir" != "." ]] ; then
-                pushd "$HOME" > /dev/null
-
-                # Call rmdir with a relative path excluding $HOME.
-                # Otherwise, it might try to delete $HOME and exit
-                # with a permission error.
-                run rmdir $VERBOSE_ARG \
-                    -p --ignore-fail-on-non-empty \
-                    "$targetDir"
-
-                popd > /dev/null
-              fi
-            fi
-          done
-        '';
-      in
-      ''
-        function linkNewGen() {
+      if config.home.linker.backend == "smfh" then
+        let
+          smfh = lib.getExe config.home.linker.smfh.package;
+          prefixArg = lib.escapeShellArg config.home.linker.smfh.backupPrefix;
+        in
+        ''
           _i "Creating home file links in %s" "$HOME"
 
-          local newGenFiles
-          newGenFiles="$(readlink -e "$newGenPath/home-files")"
-          find "$newGenFiles" \( -type f -or -type l \) \
-            -exec bash ${link} "$newGenFiles" {} +
-        }
-
-        function cleanOldGen() {
-          if [[ ! -v oldGenPath || ! -e "$oldGenPath/home-files" ]] ; then
-            return
+          newManifest="$newGenPath/home-files-manifest.json"
+          if [[ ! -e "$newManifest" ]]; then
+            errorEcho "smfh manifest not found at $newManifest"
+            exit 1
           fi
 
-          _i "Cleaning up orphan links from %s" "$HOME"
+          if [[ -v oldGenPath && -e "$oldGenPath/home-files-manifest.json" ]]; then
+            run ${smfh} ''${VERBOSE:+--verbose} diff \
+              --prefix ${prefixArg} \
+              "$newManifest" \
+              "$oldGenPath/home-files-manifest.json" \
+              || exit 1
+          else
+            run ${smfh} ''${VERBOSE:+--verbose} activate \
+              --prefix ${prefixArg} \
+              "$newManifest" \
+              || exit 1
+          fi
+        ''
+      else
+        let
+          link = pkgs.writeShellScript "link" ''
+            ${config.lib.bash.initHomeManagerLib}
 
-          local newGenFiles oldGenFiles
-          newGenFiles="$(readlink -e "$newGenPath/home-files")"
-          oldGenFiles="$(readlink -e "$oldGenPath/home-files")"
+            newGenFiles="$1"
+            shift
 
-          # Apply the cleanup script on each leaf in the old
-          # generation. The find command below will print the
-          # relative path of the entry.
-          find "$oldGenFiles" '(' -type f -or -type l ')' -printf '%P\0' \
-            | xargs -0 bash ${cleanup} "$newGenFiles"
-        }
+            # Classify every target using bash builtins only: even one forked
+            # process per file costs several milliseconds on some platforms
+            # (notably darwin), which dominates activation time when a profile
+            # carries hundreds of links. Targets occupied by a regular file or
+            # directory keep the original per-file handling (backup and
+            # identical-content skip) on the slow path below.
+            declare -a symlinkTargets=() symlinkSources=()
+            declare -a linkSources=() linkDirs=()
+            declare -a slowSources=()
+            for sourcePath in "$@" ; do
+              relativePath="''${sourcePath#$newGenFiles/}"
+              targetPath="$HOME/$relativePath"
+              if [[ -L "''${targetPath%/*}" ]] ; then
+                # The parent directory is itself a symlink (e.g. a stale
+                # whole-directory link from an older layout). The batched
+                # `ln -n -t` below would refuse it ("Not a directory"), while
+                # the original per-file `ln -T` traverses it; keep upstream
+                # behavior on the slow path.
+                slowSources+=("$sourcePath")
+              elif [[ -L "$targetPath" ]] ; then
+                symlinkTargets+=("$targetPath")
+                symlinkSources+=("$sourcePath")
+              elif [[ -e "$targetPath" ]] ; then
+                slowSources+=("$sourcePath")
+              else
+                linkSources+=("$sourcePath")
+                linkDirs+=("''${targetPath%/*}")
+              fi
+            done
 
-        cleanOldGen
-        linkNewGen
-      ''
+            # Resolve all existing symlinks with a single readlink call and
+            # relink only those not already pointing at the new generation.
+            if [[ ''${#symlinkTargets[@]} -gt 0 ]] ; then
+              i=0
+              while IFS= read -r -d "" currentSource ; do
+                if [[ "$currentSource" != "''${symlinkSources[i]}" ]] ; then
+                  linkSources+=("''${symlinkSources[i]}")
+                  linkDirs+=("''${symlinkTargets[i]%/*}")
+                fi
+                i=$(( i + 1 ))
+              done < <(readlink -z -- "''${symlinkTargets[@]}")
+
+              # readlink prints no record for an operand that vanished since
+              # the classification loop above, and its exit status is lost
+              # through the process substitution. A missing record shifts
+              # every later result onto the wrong source, so the links after
+              # it would be compared against someone else's target and left
+              # stale. The record count is the only signal that happened.
+              if [[ $i -ne ''${#symlinkTargets[@]} ]] ; then
+                errorEcho "A link target changed while resolving symlinks; retry activation."
+                exit 1
+              fi
+            fi
+
+            # Create all missing parent directories in one mkdir call.
+            declare -A missingDirs=()
+            for targetDir in "''${linkDirs[@]}" ; do
+              [[ -d "$targetDir" ]] || missingDirs[$targetDir]=1
+            done
+            if [[ ''${#missingDirs[@]} -gt 0 ]] ; then
+              run mkdir -p $VERBOSE_ARG -- "''${!missingDirs[@]}" || exit 1
+            fi
+
+            # Group the pending links by parent directory, one ln call per
+            # directory. The link name always equals the source basename, and
+            # -f -n together replace a stale symlink even when it points at a
+            # directory (the case -T guarded against in the per-file version;
+            # a regular directory in the way takes the slow path instead and
+            # fails there just like it always did).
+            declare -A dirBatches=()
+            for i in "''${!linkSources[@]}" ; do
+              dirBatches[''${linkDirs[i]}]+="$i "
+            done
+            for targetDir in "''${!dirBatches[@]}" ; do
+              batch=()
+              for i in ''${dirBatches[$targetDir]} ; do
+                batch+=("''${linkSources[i]}")
+              done
+              run ln -sfn $VERBOSE_ARG -t "$targetDir" -- "''${batch[@]}" || exit 1
+            done
+
+            # Slow path: the target exists and is not a symlink. This is the
+            # original per-file logic, kept verbatim for the rare collisions.
+            for sourcePath in "''${slowSources[@]}" ; do
+              relativePath="''${sourcePath#$newGenFiles/}"
+              targetPath="$HOME/$relativePath"
+              if [[ -e "$targetPath" && ! -L "$targetPath" ]] ; then
+                if [[ -n "$HOME_MANAGER_BACKUP_COMMAND" ]] ; then
+                  verboseEcho "Running '$HOME_MANAGER_BACKUP_COMMAND' on '$targetPath'."
+                  run $HOME_MANAGER_BACKUP_COMMAND "$targetPath" || errorEcho "Running '$HOME_MANAGER_BACKUP_COMMAND' on '$targetPath' failed."
+                elif [[ -n "$HOME_MANAGER_BACKUP_EXT" ]] ; then
+                  # The target exists, back it up
+                  backup="$targetPath.$HOME_MANAGER_BACKUP_EXT"
+                  if [[ -e "$backup" && -n "$HOME_MANAGER_BACKUP_OVERWRITE" ]]; then
+                    run rm $VERBOSE_ARG "$backup"
+                  fi
+                  run mv $VERBOSE_ARG "$targetPath" "$backup" || errorEcho "Moving '$targetPath' failed!"
+                fi
+              fi
+
+              if [[ -e "$targetPath" && ! -L "$targetPath" ]] && cmp -s "$sourcePath" "$targetPath" ; then
+                # The target exists but is identical - don't do anything.
+                verboseEcho "Skipping '$targetPath' as it is identical to '$sourcePath'"
+              else
+                # Place that symlink, --force
+                # This can still fail if the target is a directory, in which case we bail out.
+                run mkdir -p $VERBOSE_ARG "$(dirname "$targetPath")"
+                run ln -Tsf $VERBOSE_ARG "$sourcePath" "$targetPath" || exit 1
+              fi
+            done
+          '';
+
+          cleanup = pkgs.writeShellScript "cleanup" ''
+            ${config.lib.bash.initHomeManagerLib}
+
+            # A symbolic link whose target path matches this pattern will be
+            # considered part of a Home Manager generation.
+            homeFilePattern="$(readlink -e ${lib.escapeShellArg builtins.storeDir})/*-home-manager-files/*"
+
+            newGenFiles="$1"
+            shift 1
+            for relativePath in "$@" ; do
+              targetPath="$HOME/$relativePath"
+              if [[ -e "$newGenFiles/$relativePath" ]] ; then
+                verboseEcho "Checking $targetPath: exists"
+              elif [[ ! "$(readlink "$targetPath")" == $homeFilePattern ]] ; then
+                warnEcho "Path '$targetPath' does not link into a Home Manager generation. Skipping delete."
+              else
+                verboseEcho "Checking $targetPath: gone (deleting)"
+                run rm $VERBOSE_ARG "$targetPath"
+
+                # Recursively delete empty parent directories.
+                targetDir="$(dirname "$relativePath")"
+                if [[ "$targetDir" != "." ]] ; then
+                  pushd "$HOME" > /dev/null
+
+                  # Call rmdir with a relative path excluding $HOME.
+                  # Otherwise, it might try to delete $HOME and exit
+                  # with a permission error.
+                  run rmdir $VERBOSE_ARG \
+                      -p --ignore-fail-on-non-empty \
+                      "$targetDir"
+
+                  popd > /dev/null
+                fi
+              fi
+            done
+          '';
+        in
+        ''
+          function linkNewGen() {
+            _i "Creating home file links in %s" "$HOME"
+
+            local newGenFiles
+            newGenFiles="$(readlink -e "$newGenPath/home-files")"
+            find "$newGenFiles" \( -type f -or -type l \) \
+              -exec bash ${link} "$newGenFiles" {} +
+          }
+
+          function cleanOldGen() {
+            if [[ ! -v oldGenPath || ! -e "$oldGenPath/home-files" ]] ; then
+              return
+            fi
+
+            _i "Cleaning up orphan links from %s" "$HOME"
+
+            local newGenFiles oldGenFiles
+            newGenFiles="$(readlink -e "$newGenPath/home-files")"
+            oldGenFiles="$(readlink -e "$oldGenPath/home-files")"
+
+            # Apply the cleanup script on each leaf in the old
+            # generation. The find command below will print the
+            # relative path of the entry.
+            find "$oldGenFiles" '(' -type f -or -type l ')' -printf '%P\0' \
+              | xargs -0 bash ${cleanup} "$newGenFiles"
+          }
+
+          cleanOldGen
+          linkNewGen
+        ''
     );
 
     home.activation.checkFilesChanged = lib.hm.dag.entryBefore [ "linkGeneration" ] (
@@ -580,5 +672,15 @@ in
             '') cfg
           )
         );
+
+    home-files-manifest.files = lib.mkIf (config.home.linker.backend == "smfh") (
+      map (v: {
+        target = "${homeDirectory}/${v.target}";
+        source = v.source;
+        type = if v.executable != null then "copy" else "symlink";
+        permissions = if ((v.executable != null) && (v.executable)) then "0755" else "0644";
+        clobber = v.force;
+      }) cfg
+    );
   };
 }
