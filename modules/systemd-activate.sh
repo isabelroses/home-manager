@@ -6,7 +6,7 @@ function isStartable() {
 }
 
 function isStoppable() {
-  if [[ -v oldGenPath ]] ; then
+  if [[ -n "$oldUserServicePath" ]] ; then
     local service="$1"
     [[ $(systemctl --user show -p RefuseManualStop "$service") == *=no ]]
   fi
@@ -16,21 +16,15 @@ function systemdPostReload() {
   local workDir
   workDir="$(mktemp -d)"
 
-  if [[ -v oldGenPath ]] ; then
-    local oldUserServicePath="$oldGenPath/home-files/.config/systemd/user"
-  fi
-
-  local newUserServicePath="$newGenPath/home-files/.config/systemd/user"
   local oldServiceFiles="$workDir/old-files"
   local newServiceFiles="$workDir/new-files"
   local servicesDiffFile="$workDir/diff-files"
 
-  if [[ ! (-v oldUserServicePath && -d "$oldUserServicePath") \
-      && ! -d "$newUserServicePath" ]]; then
+  if [[ ! -d "$oldUserServicePath" && ! -d "$newUserServicePath" ]]; then
     return
   fi
 
-  if [[ ! (-v oldUserServicePath && -d "$oldUserServicePath") ]]; then
+  if [[ ! -d "$oldUserServicePath" ]]; then
     touch "$oldServiceFiles"
   else
     find "$oldUserServicePath" \
@@ -107,8 +101,11 @@ function systemdPostReload() {
   fi
 }
 
-oldGenPath="$1"
-newGenPath="$2"
+# Directories containing the systemd user units of the old and new
+# generations. The old directory may be given as an empty string when there
+# is no old generation.
+oldUserServicePath="$1"
+newUserServicePath="$2"
 
 if [[ -v DRY_RUN ]]; then
     echo systemctl --user daemon-reload

@@ -490,7 +490,7 @@ in
     home.activation.reloadSystemd = hm.dag.entryAfter [ "linkGeneration" ] (
       let
         suggestCmd = ''
-          bash ${./systemd-activate.sh} "''${oldGenPath=}" "$newGenPath"
+          bash ${./systemd-activate.sh} "''${oldUnitsDir=}" "$newUnitsDir"
         '';
 
         sdSwitchCmd =
@@ -525,21 +525,55 @@ in
             warnEcho "Attempting to reload services anyway..."
           fi
 
+          # Reconstruct a generation's systemd user unit directory from its
+          # smfh manifest. Generations linked with smfh do not contain a
+          # home-files tree.
+          function materializeUnitsDir() {
+            local manifest="$1" outDir="$2"
+            local relPath sourcePath
+
+            mkdir -p "$outDir"
+            while IFS=$'\t' read -r relPath sourcePath; do
+              mkdir -p "$outDir/$(dirname "$relPath")"
+              ln -s "$sourcePath" "$outDir/$relPath"
+            done < <(
+              ${lib.getExe pkgs.jq} -r \
+                --arg prefix ${lib.escapeShellArg "${config.xdg.configHome}/systemd/user/"} \
+                '.files[] | select(.target | startswith($prefix))
+                  | [(.target | ltrimstr($prefix)), .source] | @tsv' \
+                "$manifest"
+            )
+          }
+
+          unitsTmpDir="$(mktemp -d)"
+
           if [[ -v oldGenPath ]]; then
             oldUnitsDir="$oldGenPath/home-files${configHome}/systemd/user"
             if [[ ! -e $oldUnitsDir ]]; then
-              oldUnitsDir=
+              if [[ -e "$oldGenPath/home-files-manifest.json" ]]; then
+                oldUnitsDir="$unitsTmpDir/old"
+                materializeUnitsDir "$oldGenPath/home-files-manifest.json" "$oldUnitsDir"
+              else
+                oldUnitsDir=
+              fi
             fi
           fi
 
           newUnitsDir="$newGenPath/home-files${configHome}/systemd/user"
           if [[ ! -e $newUnitsDir ]]; then
-            newUnitsDir=${pkgs.emptyDirectory}
+            if [[ -e "$newGenPath/home-files-manifest.json" ]]; then
+              newUnitsDir="$unitsTmpDir/new"
+              materializeUnitsDir "$newGenPath/home-files-manifest.json" "$newUnitsDir"
+            else
+              newUnitsDir=${pkgs.emptyDirectory}
+            fi
           fi
 
           ${ensureSystemd} ${systemdCmd}
 
-          unset newUnitsDir oldUnitsDir
+          rm -rf "$unitsTmpDir"
+          unset -f materializeUnitsDir
+          unset newUnitsDir oldUnitsDir unitsTmpDir
         else
           echo "User systemd daemon not running. Skipping reload."
         fi

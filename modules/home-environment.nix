@@ -916,15 +916,17 @@ in
           substituteInPlace $out/activate \
             --subst-var-by GENERATION_DIR $out
 
-          ln -s ${config.home-files} $out/home-files
           ln -s ${cfg.path} $out/home-path
-          ${lib.optionalString (config.home.linker.backend == "smfh") (
-            let
-              jsonFormat = pkgs.formats.json { };
-              manifestFile = jsonFormat.generate "home-manager-files-manifest.json" config.home-files-manifest;
-            in
-            "ln -s ${manifestFile} $out/home-files-manifest.json"
-          )}
+          ${
+            if config.home.linker.backend == "smfh" then
+              let
+                jsonFormat = pkgs.formats.json { };
+                manifestFile = jsonFormat.generate "home-manager-files-manifest.json" config.home-files-manifest;
+              in
+              "ln -s ${manifestFile} $out/home-files-manifest.json"
+            else
+              "ln -s ${config.home-files} $out/home-files"
+          }
 
           cp "$extraDependenciesPath" "$out/extra-dependencies"
 

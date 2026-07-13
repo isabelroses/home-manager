@@ -101,10 +101,14 @@ in
           version = lib.mkOption {
             type = lib.types.int;
             default = 3;
+            internal = true;
+            description = "Manifest format version understood by smfh.";
           };
 
           files = lib.mkOption {
             type = lib.types.listOf lib.types.attrs;
+            internal = true;
+            description = "File entries of the smfh manifest.";
           };
         };
       };
@@ -134,8 +138,9 @@ in
           - `smfh`: build a JSON manifest from {option}`home.file` and invoke
             [smfh](https://github.com/feel-co/smfh) against it. Note that
             {env}`HOME_MANAGER_BACKUP_EXT` and `HOME_MANAGER_BACKUP_COMMAND`
-            are ignored. smfh handles backups itself via its own prefix (see
-            {option}`home.linker.smfh.backupPrefix`).
+            are ignored, and that an existing file at a managed target is
+            replaced rather than backed up, since every manifest entry sets
+            smfh's `clobber` so that links are always refreshed.
         '';
       };
 
@@ -150,6 +155,10 @@ in
             it is moved out of the way during activation. Passed via
             `--prefix`. Only used when {option}`home.linker.backend` is
             `"smfh"`.
+
+            Note that entries generated from {option}`home.file` always
+            clobber their target, so this prefix only applies to entries
+            added to {option}`home.linker.smfh` manifests by other means.
           '';
         };
       };
@@ -445,6 +454,10 @@ in
 
           function cleanOldGen() {
             if [[ ! -v oldGenPath || ! -e "$oldGenPath/home-files" ]] ; then
+              if [[ -v oldGenPath && -e "$oldGenPath/home-files-manifest.json" ]] ; then
+                warnEcho "The previous generation was linked with smfh;" \
+                  "files it created will not be cleaned up automatically."
+              fi
               return
             fi
 
@@ -466,48 +479,52 @@ in
         ''
     );
 
-    home.activation.checkFilesChanged = lib.hm.dag.entryBefore [ "linkGeneration" ] (
-      let
-        homeDirArg = lib.escapeShellArg homeDirectory;
-      in
-      ''
-        function _cmp() {
-          if [[ -d $1 && -d $2 ]]; then
-            diff -rq "$1" "$2" &> /dev/null
-          else
-            cmp --quiet "$1" "$2"
-          fi
-        }
-        declare -A changedFiles
-      ''
-      + lib.concatMapStrings (
-        v:
+    home.activation.checkFilesChanged = lib.mkIf (config.home.linker.backend == "builtin") (
+      lib.hm.dag.entryBefore [ "linkGeneration" ] (
         let
-          sourceArg = lib.escapeShellArg (sourceStorePath v);
-          targetArg = lib.escapeShellArg v.target;
+          homeDirArg = lib.escapeShellArg homeDirectory;
         in
         ''
-          _cmp ${sourceArg} ${homeDirArg}/${targetArg} \
-            && changedFiles[${targetArg}]=0 \
-            || changedFiles[${targetArg}]=1
+          function _cmp() {
+            if [[ -d $1 && -d $2 ]]; then
+              diff -rq "$1" "$2" &> /dev/null
+            else
+              cmp --quiet "$1" "$2"
+            fi
+          }
+          declare -A changedFiles
         ''
-      ) (lib.filter (v: v.onChange != "") cfg)
-      + ''
-        unset -f _cmp
-      ''
+        + lib.concatMapStrings (
+          v:
+          let
+            sourceArg = lib.escapeShellArg (sourceStorePath v);
+            targetArg = lib.escapeShellArg v.target;
+          in
+          ''
+            _cmp ${sourceArg} ${homeDirArg}/${targetArg} \
+              && changedFiles[${targetArg}]=0 \
+              || changedFiles[${targetArg}]=1
+          ''
+        ) (lib.filter (v: v.onChange != "") cfg)
+        + ''
+          unset -f _cmp
+        ''
+      )
     );
 
-    home.activation.onFilesChange = lib.hm.dag.entryAfter [ "linkGeneration" ] (
-      lib.concatMapStrings (v: ''
-        if (( ''${changedFiles[${lib.escapeShellArg v.target}]} == 1 )); then
-          if [[ -v DRY_RUN || -v VERBOSE ]]; then
-            echo "Running onChange hook for" ${lib.escapeShellArg v.target}
+    home.activation.onFilesChange = lib.mkIf (config.home.linker.backend == "builtin") (
+      lib.hm.dag.entryAfter [ "linkGeneration" ] (
+        lib.concatMapStrings (v: ''
+          if (( ''${changedFiles[${lib.escapeShellArg v.target}]} == 1 )); then
+            if [[ -v DRY_RUN || -v VERBOSE ]]; then
+              echo "Running onChange hook for" ${lib.escapeShellArg v.target}
+            fi
+            if [[ ! -v DRY_RUN ]]; then
+              ${v.onChange}
+            fi
           fi
-          if [[ ! -v DRY_RUN ]]; then
-            ${v.onChange}
-          fi
-        fi
-      '') (lib.filter (v: v.onChange != "") cfg)
+        '') (lib.filter (v: v.onChange != "") cfg)
+      )
     );
 
     # Symlink directories and files that have the right execute bit.
@@ -674,13 +691,20 @@ in
         );
 
     home-files-manifest.files = lib.mkIf (config.home.linker.backend == "smfh") (
-      map (v: {
-        target = "${homeDirectory}/${v.target}";
-        source = v.source;
-        type = if v.executable != null then "copy" else "symlink";
-        permissions = if ((v.executable != null) && (v.executable)) then "0755" else "0644";
-        clobber = v.force;
-      }) cfg
+      map (
+        v:
+        let
+          type = if v.executable != null then "copy" else "symlink";
+        in
+        {
+          inherit type;
+          inherit (v) source;
+          target = "${homeDirectory}/${v.target}";
+          ${if (type == "symlink") then null else "clobber"} = true;
+          ${if (type == "symlink") then null else "permissions"} =
+            if ((v.executable != null) && (v.executable)) then "0755" else "0644";
+        }
+      ) cfg
     );
   };
 }
